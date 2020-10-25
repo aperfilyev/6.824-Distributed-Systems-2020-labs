@@ -98,7 +98,6 @@ fi
 
 wait ; wait
 
-
 echo '***' Starting map parallelism test.
 
 rm -f mr-out* mr-worker*

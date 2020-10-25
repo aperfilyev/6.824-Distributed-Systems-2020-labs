@@ -1,10 +1,15 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/gob"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,41 +29,124 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	var args interface{}
+	var reply interface{}
+	call("Master.RegisterWorker", &args, &reply)
 
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
+	gob.Register(Map{})
+	gob.Register(Reduce{})
+	gob.Register(Finish{})
 
+Loop:
+	for {
+		task := requestTask()
+		switch v := task.(type) {
+		case Map:
+			doMap(v, mapf)
+		case Reduce:
+			doReduce(v, reducef)
+		case Finish:
+			break Loop
+		}
+
+		reportTaskDone(task)
+	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func requestTask() Task {
+	var reply TaskReply
+	var args TaskArgs
+	success := call("Master.GetTask", &args, &reply)
+	if (!success) {
+		return Finish{}
+	}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	return reply.Task
+}
 
-	// fill in the argument(s).
-	args.X = 99
+func doMap(m Map, mapf func(string, string) []KeyValue) {
+	fn := m.FileName
+	f, e := ioutil.ReadFile(fn)
+	if e != nil {
+		log.Fatal("reading:", e)
+	}
+	kva := mapf(fn, string(f))
+	reduces := make([][]KeyValue, m.NReduce)
+	for _, kv := range kva {
+		index := ihash(kv.Key) % m.NReduce
+		reduces[index] = append(reduces[index], kv)
+	}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	for idx, l := range reduces {
+		fileName := reduceName(m.MapperNum, idx)
+		f, err := os.Create(fileName)
+		if err != nil {
+			log.Fatal("opening:", err)
+		}
+		enc := json.NewEncoder(f)
+		for _, kv := range l {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatal("writing: ", err)
+			}
+		}
+	}
+}
 
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+func reduceName(mapIdx, reduceIdx int) string {
+	return fmt.Sprintf("mr-%d-%d", mapIdx, reduceIdx)
+}
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+func mergeName(reduceIdx int) string {
+	return fmt.Sprintf("mr-out-%d", reduceIdx)
+}
+
+func doReduce(r Reduce, reducef func(string, []string) string) {
+	kvMap := make(map[string][]string)
+	for i := 0; i < r.NMap; i++ {
+		inputName := reduceName(i, r.ReducerNum)
+		file, err := os.Open(inputName)
+		if err != nil {
+			log.Fatalf("failed to read: %v", err)
+		}
+		defer file.Close()
+
+		decoder := json.NewDecoder(file)
+		var kv KeyValue
+		for err := decoder.Decode(&kv); err == nil; err = decoder.Decode(&kv) {
+			key := kv.Key
+			val := kv.Value
+			kvMap[key] = append(kvMap[key], val)
+		}
+	}
+
+	var kvList []KeyValue
+	for k, v := range kvMap {
+		kvList = append(kvList, KeyValue{k, reducef(k, v)})
+	}
+
+	outName := mergeName(r.ReducerNum)
+	outputFile, err := os.Create(outName)
+	if err != nil {
+		log.Fatal("Create file:", err)
+	}
+	for _, kv := range kvList {
+		fmt.Fprintf(outputFile, "%v %v\n", kv.Key, kv.Value)
+	}
+	outputFile.Close()
+}
+
+func reportTaskDone(task Task) {
+	var reply TaskReply
+	var args TaskArgs
+	args.Task = task
+	call("Master.TaskDone", &args, &reply)
 }
 
 //
@@ -79,7 +167,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-
 	fmt.Println(err)
 	return false
 }

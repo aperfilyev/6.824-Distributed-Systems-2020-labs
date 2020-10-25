@@ -1,29 +1,58 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"encoding/gob"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
-
+// Master definition
 type Master struct {
-	// Your definitions here.
+	nMap       int
+	nReduce    int
+	nWorkers   int
+	tasks      chan Task
+	inProgress map[Task]int64
 
+	mux sync.Mutex
+	wg  sync.WaitGroup
+
+	stopTicker chan bool
+	done       bool
 }
 
-// Your code here -- RPC handlers for the worker to call.
-
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func (m *Master) RegisterWorker(args *interface{}, reply *interface{}) error {
+	m.mux.Lock()
+	m.nWorkers++
+	m.mux.Unlock()
 	return nil
 }
 
+func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
+	for {
+		select {
+		case t := <-m.tasks:
+			reply.Task = t
+			m.mux.Lock()
+			m.inProgress[t] = time.Now().Unix()
+			m.mux.Unlock()
+			return nil
+		}
+	}
+}
+
+func (m *Master) TaskDone(args *TaskArgs, reply *TaskReply) error {
+	m.mux.Lock()
+	delete(m.inProgress, args.Task)
+	m.mux.Unlock()
+	m.wg.Done()
+	return nil
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -46,12 +75,9 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	m.mux.Lock()
+	defer m.mux.Unlock()
+	return m.done
 }
 
 //
@@ -60,11 +86,77 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	gob.Register(Map{})
+	gob.Register(Reduce{})
+	gob.Register(Finish{})
 
-	// Your code here.
+	m := Master{
+		nMap:       len(files),
+		nReduce:    nReduce,
+		tasks:      make(chan Task),
+		inProgress: make(map[Task]int64),
 
+		stopTicker: make(chan bool),
+	}
+
+	m.enqueueTasks(files, nReduce)
+
+	m.startTicker()
 
 	m.server()
+
 	return &m
+}
+
+func (m *Master) enqueueTasks(files []string, nReduce int) {
+	go func() {
+		nMap := len(files)
+		for i, file := range files {
+			m.tasks <- Map{i, file, nReduce}
+			m.wg.Add(1)
+		}
+
+		m.wg.Wait()
+
+		for i := 0; i < nReduce; i++ {
+			m.tasks <- Reduce{i, nMap}
+			m.wg.Add(1)
+		}
+
+		m.wg.Wait()
+
+		m.mux.Lock()
+		workers := m.nWorkers
+		m.mux.Unlock()
+		for i := 0; i < workers; i++ {
+			m.tasks <- Finish{}
+		}
+		m.stopTicker <- true
+	}()
+}
+
+func (m *Master) startTicker() {
+	ticker := time.NewTicker(1 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-m.stopTicker:
+				ticker.Stop()
+				m.mux.Lock()
+				m.done = true
+				m.mux.Unlock()
+				return
+			case <-ticker.C:
+				now := time.Now().Unix()
+				m.mux.Lock()
+				for k, v := range m.inProgress {
+					if now-v >= 10 {
+						m.tasks <- k
+						delete(m.inProgress, k)
+					}
+				}
+				m.mux.Unlock()
+			}
+		}
+	}()
 }
